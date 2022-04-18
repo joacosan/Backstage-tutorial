@@ -1,0 +1,189 @@
+apiVersion: scaffolder.backstage.io/v1beta3
+kind: Template
+metadata:
+  name: superdigital-microservice
+  title: Superdigital Microservice
+  description: Generate Microservice archetype and its pipelines
+  tags:
+    - recommended
+    - dotnet
+    - microservice
+    - archetype
+    - webapi
+    - hangfire
+    - worker
+spec:
+  owner: Superdigital
+  type: archetype
+  parameters:
+    - title: Provide some simple information about default entrypoint
+      required:
+        - app_name
+        - namespace
+        - template
+        - system
+      properties:
+        app_name:
+          title: Identification
+          type: string
+          description: Application unique name.  It is used for helm release name, superdigital application name. Domain prefix wil be added automatically, the domain will be used for kubernetes namespace, harbor project pipeline/release folder.
+          pattern: '^\S*[a-z\-]$'
+        namespace:
+          title: Assembly Name
+          type: string
+          description: Application assembly. Super prefix will be added automatically.
+          pattern: '^\S*[a-zA-Z]$'
+        template:
+          title: Template
+          type: string
+          description: Archtype for default entrypoint
+          enum:
+            - webapi
+            - worker
+            - hangfire
+        system:
+          title: System
+          type: string
+          description: System that its component is part of. It is used for pipeline/release folder
+          ui:field: EntityPicker
+          ui:options:
+            allowedKinds:
+              - System
+            defaultKind: System
+    - title: Select dependencies
+      properties:
+        enable_silverback:
+          title: Enable Kafka integration
+          type: boolean
+          description: Wheater or not to add Silverback dependencies
+        enable_mongodb:
+          title: Enable MongoDb integration
+          type: boolean
+          description: Wheater or not to add MongoDb dependencies
+        enable_redis:
+          title: Enable Redis integration
+          type: boolean
+          description: Wheater or not to add Redis dependencies
+  steps:
+    - id: appnamecompute
+      name: Compute app Superdigital name
+      action: superdigital:utils:appname:compute
+      input:
+        template: ${{ parameters.template }}
+        appName: ${{ parameters.app_name }}
+        system: ${{ parameters.system }}
+        type: ms
+
+    - id: updatetemplate
+      name: Update Superdigital template
+      action: dotnet:template:install
+      input:
+        package: Superdigital.Templates
+        args:
+          - --nuget-source
+          - https://pkgs.dev.azure.com/Superdigital-HoldCo/_packaging/Superdigital-HoldCo/nuget/v3/index.json
+
+    - id: template
+      name: Run dotnet template
+      action: dotnet:new
+      input:
+        template: sd-ms
+        args:
+          - --namespace
+          - ${{ parameters.namespace }}
+          - --template
+          - ${{ parameters.template }}
+          - --app-name
+          - ${{ steps.appnamecompute.output.appName }}
+          - --system
+          - ${{ parameters.system }}
+          - --team
+          - ${{ steps.appnamecompute.output.owner}}
+          - --domain
+          - ${{ steps.appnamecompute.output.domain }}
+          - --repository
+          - ${{ steps.appnamecompute.output.repoName }}
+          - --silverback
+          - ${{ parameters.enable_silverback }}
+          - --mongodb
+          - ${{ parameters.enable_mongodb }}
+          - --redis
+          - ${{ parameters.enable_redis }}
+          - --k8s-namespace
+          - ${{ steps.appnamecompute.output.k8sNamespace }}
+
+    - id: build
+      name: Run dotnet build
+      action: dotnet:build
+
+    - id: publish
+      name: Publish
+      action: publish:azure
+      input:
+        allowedHosts: ['dev.azure.com']
+        description: This is ${{ steps.appnamecompute.output.appName }}
+        repoUrl: ${{ steps.appnamecompute.output.repoUrl }}
+
+    - id: register
+      name: Register
+      action: catalog:register
+      input:
+        repoContentsUrl: ${{ steps.publish.output.repoContentsUrl }}
+        catalogInfoPath: "/catalog-info.yaml"
+
+    - id: createbuild
+      name: Create default entrypoint build definition
+      action: plusultra:az:build:definition:create
+      input:
+        buildName: ${{ steps.appnamecompute.output.appName }}
+        repo: ${{  steps.appnamecompute.output.repoUrl | parseRepoUrl }}
+        defaultBranch: 'refs/heads/master'
+        folder: ${{ steps.appnamecompute.output.domain + "/" + parameters.system + "/" + steps.appnamecompute.output.repoName }}
+        yamlFilename: src/Super.${{ parameters.namespace + "." + steps.appnamecompute.output.projectSuffix }}/azure-pipelines.yml
+
+    - id: createlibspipeline
+      if: ${{ parameters.template === 'webapi' }}
+      name: Create libs build definition
+      action: plusultra:az:build:definition:create
+      input:
+        buildName: ${{  steps.appnamecompute.output.repoName }}-libs
+        repo: ${{  steps.appnamecompute.output.repoUrl | parseRepoUrl }}
+        defaultBranch: 'refs/heads/master'
+        folder: ${{ steps.appnamecompute.output.domain + "/" + parameters.system + "/" + steps.appnamecompute.output.repoName }}
+        yamlFilename: src/libs/azure-pipelines.yml
+
+    - id: createtechdocspipeline
+      name: Create techdocs build definition
+      action: plusultra:az:build:definition:create
+      input:
+        buildName: ${{  steps.appnamecompute.output.repoName }}-docs
+        repo: ${{  steps.appnamecompute.output.repoUrl | parseRepoUrl }}
+        defaultBranch: 'refs/heads/master'
+        folder: ${{ steps.appnamecompute.output.domain + "/" + parameters.system + "/" + steps.appnamecompute.output.repoName }}
+        yamlFilename: docs-pipelines.yml
+
+    - id: azurerepoinfo
+      name: Get azure repo information
+      action: plusultra:az:repo:get
+      input:
+        repoName: ${{ steps.appnamecompute.output.repoName }}
+
+    - id: addbuildvalidation
+      name: Add build validation
+      action: plusultra:az:repo:buildvalidation:add
+      input:
+        repoId: ${{ steps.azurerepoinfo.output.repositoryId }}
+        buildDefinitionId: ${{ steps.createbuild.output.buildDefinitionId }}
+        defaultBranch: 'refs/heads/master'
+
+    - id: createrelease
+      name: Creat Release definition
+      action: plusultra:az:release:definition:create
+      input:
+        repo: ${{ steps.appnamecompute.output.repoUrl | parseRepoUrl }}
+        primaryArtifactDefinitionId: ${{ steps.createbuild.output.buildDefinitionId }}
+        
+
+  output:
+    remoteUrl: ${{ steps.publish.output.remoteUrl }}
+    entityRef: ${{ steps.register.output.entityRef }}
